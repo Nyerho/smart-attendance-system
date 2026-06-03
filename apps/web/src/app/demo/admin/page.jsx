@@ -11,9 +11,11 @@ import {
 import {
   CheckCircle,
   MapPin,
+  Play,
   RefreshCw,
   Save,
   Shield,
+  Square,
   Users,
 } from "lucide-react";
 import { db, initFirebaseAnalytics } from "@/utils/firebase.client";
@@ -138,6 +140,7 @@ export default function DemoAdminPage() {
           courseTitle: form.courseTitle.trim(),
           radiusMeters: Number(form.radiusMeters),
           classroomLocation: form.classroomLocation,
+          attendanceOpen: false,
           updatedAt: serverTimestamp(),
         },
         { merge: true },
@@ -146,6 +149,32 @@ export default function DemoAdminPage() {
       await refreshData();
     } catch (error) {
       setStatus(`Could not save course config. ${error.code || ""}`.trim());
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function updateAttendanceState(courseCode, attendanceOpen) {
+    setBusy(true);
+    try {
+      await setDoc(
+        doc(db, COURSE_CONFIGS_COLLECTION, courseCode),
+        {
+          attendanceOpen,
+          attendanceStartedAt: attendanceOpen ? serverTimestamp() : null,
+          attendanceStoppedAt: attendanceOpen ? null : serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true },
+      );
+      setStatus(
+        attendanceOpen
+          ? `Attendance started for ${courseCode}. Students can now check in.`
+          : `Attendance stopped for ${courseCode}. Students can no longer check in.`,
+      );
+      await refreshData();
+    } catch (error) {
+      setStatus(`Could not update attendance state. ${error.code || ""}`.trim());
     } finally {
       setBusy(false);
     }
@@ -327,6 +356,33 @@ export default function DemoAdminPage() {
                       {config.classroomLocation
                         ? `${config.classroomLocation.lat.toFixed(5)}, ${config.classroomLocation.lng.toFixed(5)}`
                         : "Not set"}
+                    </div>
+                    <div className="mt-3 flex flex-wrap items-center gap-2">
+                      <span
+                        className={`rounded-full px-2.5 py-1 text-xs font-semibold ${
+                          config.attendanceOpen
+                            ? "bg-emerald-500/15 text-emerald-300"
+                            : "bg-amber-500/15 text-amber-300"
+                        }`}
+                      >
+                        {config.attendanceOpen ? "Attendance Open" : "Attendance Closed"}
+                      </span>
+                      <button
+                        onClick={() => updateAttendanceState(config.courseCode, true)}
+                        disabled={busy || config.attendanceOpen}
+                        className="inline-flex items-center gap-1 rounded-xl bg-emerald-600 px-3 py-2 text-xs font-semibold text-white transition hover:bg-emerald-500 disabled:opacity-50"
+                      >
+                        <Play size={12} />
+                        Start
+                      </button>
+                      <button
+                        onClick={() => updateAttendanceState(config.courseCode, false)}
+                        disabled={busy || !config.attendanceOpen}
+                        className="inline-flex items-center gap-1 rounded-xl bg-red-600 px-3 py-2 text-xs font-semibold text-white transition hover:bg-red-500 disabled:opacity-50"
+                      >
+                        <Square size={12} />
+                        Stop
+                      </button>
                     </div>
                   </div>
                 ))

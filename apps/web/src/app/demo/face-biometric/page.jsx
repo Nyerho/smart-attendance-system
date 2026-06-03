@@ -378,6 +378,13 @@ export default function FaceBiometricDemoPage() {
       }
 
       setCourseConfig(config);
+      if (!config.attendanceOpen) {
+        setPresenceConfirmed(false);
+        setStatusMessage(
+          `Attendance has not been started yet for ${config.courseCode}. Ask the lecturer to open attendance first.`,
+        );
+        return;
+      }
       const distance = calculateDistanceMeters(latestLocation, config.classroomLocation);
       if (typeof distance === "number" && distance > Number(config.radiusMeters || 0)) {
         setPresenceConfirmed(false);
@@ -449,6 +456,10 @@ export default function FaceBiometricDemoPage() {
   }
 
   async function startCamera() {
+    if (!courseConfig?.attendanceOpen) {
+      setStatusMessage("Attendance is closed. Wait for the lecturer to start attendance.");
+      return;
+    }
     if (!presenceConfirmed) {
       setStatusMessage("Confirm course and classroom presence before starting the camera.");
       return;
@@ -554,6 +565,9 @@ export default function FaceBiometricDemoPage() {
   }
 
   async function ensureInsideClassroomForAttendance() {
+    if (!courseConfig?.attendanceOpen) {
+      throw new Error("Attendance is currently closed by the lecturer.");
+    }
     const latestLocation = (await refreshLocation()) || currentLocation;
     const latestDistance = calculateDistanceMeters(latestLocation, classroomLocation);
     if (classroomLocation && latestLocation && latestDistance > radiusMeters) {
@@ -866,6 +880,11 @@ export default function FaceBiometricDemoPage() {
                       Lecturer: {courseConfig.lecturerName || "N/A"} · Radius: {courseConfig.radiusMeters}m
                     </div>
                   ) : null}
+                  {courseConfig ? (
+                    <div className="mt-2 text-xs text-white/50">
+                      Attendance: {courseConfig.attendanceOpen ? "open" : "closed"}
+                    </div>
+                  ) : null}
                 </div>
               </div>
 
@@ -886,6 +905,9 @@ export default function FaceBiometricDemoPage() {
                   {presenceConfirmed
                     ? `Presence confirmed (${formatDistance(distanceFromClassroom)})`
                     : "Presence not confirmed"}
+                </StatusPill>
+                <StatusPill ok={!!courseConfig?.attendanceOpen}>
+                  {courseConfig?.attendanceOpen ? "Attendance open" : "Attendance closed"}
                 </StatusPill>
               </div>
             </div>
@@ -1058,6 +1080,9 @@ export default function FaceBiometricDemoPage() {
                 </StatusPill>
                 <StatusPill ok={presenceConfirmed}>
                   {presenceConfirmed ? "Course and location confirmed" : "Course not confirmed"}
+                </StatusPill>
+                <StatusPill ok={!!courseConfig?.attendanceOpen}>
+                  {courseConfig?.attendanceOpen ? "Lecturer opened attendance" : "Lecturer has not opened attendance"}
                 </StatusPill>
                 <StatusPill ok={cameraOn && videoReady}>
                   {cameraOn && videoReady ? "Live camera feed visible" : "Camera feed not active"}
