@@ -27,7 +27,10 @@ import {
   buildRegistrationId,
   COURSE_CONFIGS_COLLECTION,
   DEMO_SESSIONS_COLLECTION,
+  getLocalCourseConfig,
   normalizeCourseCode,
+  saveLocalAttendanceLog,
+  saveLocalStudentRegistration,
   STUDENT_REGISTRATIONS_COLLECTION,
 } from "@/utils/attendanceDemo";
 
@@ -325,37 +328,51 @@ export default function FaceBiometricDemoPage() {
     if (!normalizedCode) {
       throw new Error("Enter a valid course code first.");
     }
-    const snapshot = await getDoc(doc(db, COURSE_CONFIGS_COLLECTION, normalizedCode));
-    if (!snapshot.exists()) {
+    try {
+      const snapshot = await getDoc(doc(db, COURSE_CONFIGS_COLLECTION, normalizedCode));
+      if (snapshot.exists()) {
+        return snapshot.data();
+      }
+    } catch {
+      // Fall through to browser-local preview storage.
+    }
+    const localConfig = getLocalCourseConfig(normalizedCode);
+    if (!localConfig) {
       throw new Error("No lecturer classroom setup was found for that course code.");
     }
-    return snapshot.data();
+    setFirebaseStatus("Using browser-saved lecturer course setup for this preview.");
+    return localConfig;
   }
 
   async function syncStudentRegistration(extra = {}) {
     const normalizedCode = normalizeCourseCode(courseCode);
     if (!studentName || !matNumber || !normalizedCode) return;
+    const registrationPayload = {
+      id: buildRegistrationId(matNumber, normalizedCode),
+      studentName: studentName.trim(),
+      matNumber: matNumber.trim().toUpperCase(),
+      courseCode: normalizedCode,
+      courseTitle: courseConfig?.courseTitle || "",
+      lecturerName: courseConfig?.lecturerName || "",
+      lecturerEmail: courseConfig?.lecturerEmail || "",
+      classroomLocation,
+      radiusMeters,
+      updatedAt: new Date().toISOString(),
+      ...extra,
+    };
+    saveLocalStudentRegistration(registrationPayload);
     try {
       await setDoc(
         doc(db, STUDENT_REGISTRATIONS_COLLECTION, buildRegistrationId(matNumber, normalizedCode)),
-        {
-          studentName: studentName.trim(),
-          matNumber: matNumber.trim().toUpperCase(),
-          courseCode: normalizedCode,
-          courseTitle: courseConfig?.courseTitle || "",
-          lecturerName: courseConfig?.lecturerName || "",
-          lecturerEmail: courseConfig?.lecturerEmail || "",
-          classroomLocation,
-          radiusMeters,
-          updatedAt: serverTimestamp(),
-          ...extra,
-        },
+        { ...registrationPayload, updatedAt: serverTimestamp() },
         { merge: true },
       );
       setFirebaseSyncOk(true);
     } catch (error) {
       setFirebaseSyncOk(false);
-      setFirebaseStatus(`Firebase registration write failed. ${error.code || ""}`.trim());
+      setFirebaseStatus(
+        `Registration saved in browser preview storage. Firestore write failed ${error.code || ""}`.trim(),
+      );
     }
   }
 
@@ -528,6 +545,7 @@ export default function FaceBiometricDemoPage() {
 
   async function pushAttendanceEntryToFirebase(entry) {
     if (!demoSessionId) return;
+    saveLocalAttendanceLog(entry);
     try {
       await addDoc(collection(db, ATTENDANCE_LOGS_COLLECTION), {
         ...entry,
@@ -538,7 +556,9 @@ export default function FaceBiometricDemoPage() {
       setFirebaseStatus("Firebase sync active. Attendance event saved.");
     } catch (error) {
       setFirebaseSyncOk(false);
-      setFirebaseStatus(`Firebase write blocked. Check Firestore rules. ${error.code || ""}`.trim());
+      setFirebaseStatus(
+        `Attendance saved in browser preview storage. Firestore write failed ${error.code || ""}`.trim(),
+      );
     }
   }
 

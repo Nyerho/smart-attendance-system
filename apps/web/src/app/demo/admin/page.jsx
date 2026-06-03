@@ -22,9 +22,14 @@ import { db, initFirebaseAnalytics } from "@/utils/firebase.client";
 import {
   ATTENDANCE_LOGS_COLLECTION,
   COURSE_CONFIGS_COLLECTION,
+  readLocalAttendanceLogs,
+  readLocalCourseConfigs,
+  readLocalStudentRegistrations,
+  saveLocalCourseConfig,
   STUDENT_REGISTRATIONS_COLLECTION,
   formatTimestamp,
   normalizeCourseCode,
+  updateLocalAttendanceState,
 } from "@/utils/attendanceDemo";
 
 function groupByCourse(items) {
@@ -80,6 +85,23 @@ export default function DemoAdminPage() {
 
   async function refreshData() {
     setBusy(true);
+    const localConfigs = readLocalCourseConfigs();
+    const localRegistrations = readLocalStudentRegistrations();
+    const localAttendanceLogs = readLocalAttendanceLogs();
+
+    setConfigs(
+      localConfigs.sort((a, b) =>
+        normalizeCourseCode(a.courseCode).localeCompare(normalizeCourseCode(b.courseCode)),
+      ),
+    );
+    setRegistrations(
+      localRegistrations.sort((a, b) =>
+        normalizeCourseCode(a.courseCode).localeCompare(normalizeCourseCode(b.courseCode)),
+      ),
+    );
+    setAttendanceLogs(
+      localAttendanceLogs.sort((a, b) => new Date(b.at || 0) - new Date(a.at || 0)),
+    );
     try {
       await initFirebaseAnalytics();
       const [configSnapshot, registrationSnapshot, attendanceSnapshot] = await Promise.all([
@@ -105,7 +127,9 @@ export default function DemoAdminPage() {
       );
       setStatus("Lecturer setup and attendance data refreshed from Firebase.");
     } catch (error) {
-      setStatus(`Firebase read failed. Check Firestore rules. ${error.code || ""}`.trim());
+      setStatus(
+        `Firestore unavailable in preview. Using browser-saved demo data. ${error.code || ""}`.trim(),
+      );
     } finally {
       setBusy(false);
     }
@@ -130,25 +154,30 @@ export default function DemoAdminPage() {
     }
 
     setBusy(true);
+    const coursePayload = {
+      lecturerName: form.lecturerName.trim(),
+      lecturerEmail: form.lecturerEmail.trim(),
+      courseCode,
+      courseTitle: form.courseTitle.trim(),
+      radiusMeters: Number(form.radiusMeters),
+      classroomLocation: form.classroomLocation,
+      attendanceOpen: false,
+      updatedAt: new Date().toISOString(),
+    };
     try {
+      saveLocalCourseConfig(coursePayload);
       await setDoc(
         doc(db, COURSE_CONFIGS_COLLECTION, courseCode),
-        {
-          lecturerName: form.lecturerName.trim(),
-          lecturerEmail: form.lecturerEmail.trim(),
-          courseCode,
-          courseTitle: form.courseTitle.trim(),
-          radiusMeters: Number(form.radiusMeters),
-          classroomLocation: form.classroomLocation,
-          attendanceOpen: false,
-          updatedAt: serverTimestamp(),
-        },
+        { ...coursePayload, updatedAt: serverTimestamp() },
         { merge: true },
       );
       setStatus(`Course ${courseCode} saved. Students can now register and attend with this geofence.`);
       await refreshData();
     } catch (error) {
-      setStatus(`Could not save course config. ${error.code || ""}`.trim());
+      await refreshData();
+      setStatus(
+        `Course ${courseCode} saved in browser preview storage. Firestore write failed ${error.code || ""}`.trim(),
+      );
     } finally {
       setBusy(false);
     }
@@ -157,6 +186,7 @@ export default function DemoAdminPage() {
   async function updateAttendanceState(courseCode, attendanceOpen) {
     setBusy(true);
     try {
+      updateLocalAttendanceState(courseCode, attendanceOpen);
       await setDoc(
         doc(db, COURSE_CONFIGS_COLLECTION, courseCode),
         {
@@ -174,7 +204,12 @@ export default function DemoAdminPage() {
       );
       await refreshData();
     } catch (error) {
-      setStatus(`Could not update attendance state. ${error.code || ""}`.trim());
+      await refreshData();
+      setStatus(
+        `${
+          attendanceOpen ? "Attendance started" : "Attendance stopped"
+        } in browser preview storage for ${courseCode}. Firestore write failed ${error.code || ""}`.trim(),
+      );
     } finally {
       setBusy(false);
     }
