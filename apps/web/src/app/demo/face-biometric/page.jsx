@@ -2,7 +2,14 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as faceapi from "face-api.js";
-import { addDoc, collection, doc, serverTimestamp, setDoc } from "firebase/firestore";
+import {
+  addDoc,
+  collection,
+  doc,
+  getDoc,
+  serverTimestamp,
+  setDoc,
+} from "firebase/firestore";
 import {
   Camera,
   CheckCircle,
@@ -13,9 +20,16 @@ import {
   Shield,
   Trash2,
   UserCheck,
-  XCircle,
 } from "lucide-react";
 import { db, initFirebaseAnalytics } from "@/utils/firebase.client";
+import {
+  ATTENDANCE_LOGS_COLLECTION,
+  buildRegistrationId,
+  COURSE_CONFIGS_COLLECTION,
+  DEMO_SESSIONS_COLLECTION,
+  normalizeCourseCode,
+  STUDENT_REGISTRATIONS_COLLECTION,
+} from "@/utils/attendanceDemo";
 
 const MODELS_URL = "https://justadudewhohacks.github.io/face-api.js/models";
 const STORAGE_KEY = "smart-attendance-face-biometric-demo";
@@ -67,8 +81,9 @@ function sanitizeRegisteredProfile(profile) {
   if (!profile) return null;
   return {
     name: profile.name || "",
+    matNumber: profile.matNumber || "",
+    courseCode: profile.courseCode || "",
     faceRegisteredAt: profile.faceRegisteredAt || null,
-    faceDescriptor: profile.faceDescriptor || null,
     passkeyCredentialId: profile.passkeyCredentialId || null,
     passkeyUserId: profile.passkeyUserId || null,
     passkeyRegisteredAt: profile.passkeyRegisteredAt || null,
@@ -96,16 +111,18 @@ export default function FaceBiometricDemoPage() {
   const [modelsReady, setModelsReady] = useState(false);
   const [modelsError, setModelsError] = useState("");
   const [cameraOn, setCameraOn] = useState(false);
+  const [videoReady, setVideoReady] = useState(false);
   const [busyAction, setBusyAction] = useState("");
   const [statusMessage, setStatusMessage] = useState("");
-  const [sessionTitle, setSessionTitle] = useState("Vice Chancellor Demo Session");
-  const [radiusMeters, setRadiusMeters] = useState(80);
   const [currentLocation, setCurrentLocation] = useState(null);
   const [locationError, setLocationError] = useState("");
   const [registeredProfile, setRegisteredProfile] = useState(null);
-  const [classroomLocation, setClassroomLocation] = useState(null);
   const [attendanceLog, setAttendanceLog] = useState([]);
   const [studentName, setStudentName] = useState("Demo Student");
+  const [matNumber, setMatNumber] = useState("");
+  const [courseCode, setCourseCode] = useState("");
+  const [courseConfig, setCourseConfig] = useState(null);
+  const [presenceConfirmed, setPresenceConfirmed] = useState(false);
   const [lastFaceDistance, setLastFaceDistance] = useState(null);
   const [demoSessionId, setDemoSessionId] = useState("");
   const [firebaseStatus, setFirebaseStatus] = useState("Firebase sync not started yet.");
@@ -120,12 +137,13 @@ export default function FaceBiometricDemoPage() {
     if (!saved) return;
     try {
       const parsed = JSON.parse(saved);
-      setSessionTitle(parsed.sessionTitle || "Vice Chancellor Demo Session");
-      setRadiusMeters(parsed.radiusMeters || 80);
       setRegisteredProfile(parsed.registeredProfile || null);
-      setClassroomLocation(parsed.classroomLocation || null);
       setAttendanceLog(parsed.attendanceLog || []);
       setStudentName(parsed.studentName || "Demo Student");
+      setMatNumber(parsed.matNumber || "");
+      setCourseCode(parsed.courseCode || "");
+      setCourseConfig(parsed.courseConfig || null);
+      setPresenceConfirmed(Boolean(parsed.presenceConfirmed));
     } catch {
       window.localStorage.removeItem(STORAGE_KEY);
     }
@@ -152,22 +170,38 @@ export default function FaceBiometricDemoPage() {
     window.localStorage.setItem(
       STORAGE_KEY,
       JSON.stringify({
-        sessionTitle,
-        radiusMeters,
         registeredProfile,
-        classroomLocation,
         attendanceLog,
         studentName,
+        matNumber,
+        courseCode,
+        courseConfig,
+        presenceConfirmed,
       }),
     );
   }, [
     attendanceLog,
-    classroomLocation,
-    radiusMeters,
+    courseCode,
+    courseConfig,
+    matNumber,
+    presenceConfirmed,
     registeredProfile,
-    sessionTitle,
     studentName,
   ]);
+
+  const classroomLocation = courseConfig?.classroomLocation || null;
+  const radiusMeters = Number(courseConfig?.radiusMeters || 0);
+  const sessionTitle = courseConfig?.courseTitle
+    ? `${courseConfig.courseCode} · ${courseConfig.courseTitle}`
+    : "Pending course confirmation";
+  const distanceFromClassroom = useMemo(
+    () => calculateDistanceMeters(currentLocation, classroomLocation),
+    [classroomLocation, currentLocation],
+  );
+  const insideClassroom =
+    classroomLocation && currentLocation && radiusMeters > 0
+      ? distanceFromClassroom <= radiusMeters
+      : false;
 
   useEffect(() => {
     if (!demoSessionId) return;
@@ -176,14 +210,19 @@ export default function FaceBiometricDemoPage() {
     async function syncSessionSnapshot() {
       try {
         await setDoc(
-          doc(db, "demoSessions", demoSessionId),
+          doc(db, DEMO_SESSIONS_COLLECTION, demoSessionId),
           {
             demoSessionId,
-            sessionTitle,
-            radiusMeters: Number(radiusMeters),
             studentName,
-            classroomLocation,
+            matNumber,
+            courseCode: normalizeCourseCode(courseCode),
+            courseTitle: courseConfig?.courseTitle || "",
+            lecturerName: courseConfig?.lecturerName || "",
+            lecturerEmail: courseConfig?.lecturerEmail || "",
             currentLocation,
+            classroomLocation,
+            radiusMeters,
+            presenceConfirmed,
             registeredProfile: sanitizeRegisteredProfile(registeredProfile),
             attendanceLog,
             lastFaceDistance:
@@ -196,7 +235,7 @@ export default function FaceBiometricDemoPage() {
         );
         if (!cancelled) {
           setFirebaseSyncOk(true);
-          setFirebaseStatus("Firebase sync active. Demo data is being saved.");
+          setFirebaseStatus("Firebase sync active. Student demo is saving to Firestore.");
         }
       } catch (error) {
         if (!cancelled) {
@@ -216,12 +255,15 @@ export default function FaceBiometricDemoPage() {
   }, [
     attendanceLog,
     classroomLocation,
+    courseCode,
+    courseConfig,
     currentLocation,
     demoSessionId,
     lastFaceDistance,
+    matNumber,
+    presenceConfirmed,
     radiusMeters,
     registeredProfile,
-    sessionTitle,
     studentName,
   ]);
 
@@ -236,11 +278,9 @@ export default function FaceBiometricDemoPage() {
           faceapi.nets.faceRecognitionNet.loadFromUri(MODELS_URL),
         ]);
         if (!cancelled) setModelsReady(true);
-      } catch (error) {
+      } catch {
         if (!cancelled) {
-          setModelsError(
-            "Could not load face models. Check internet access before the demo.",
-          );
+          setModelsError("Could not load face models. Check internet access before the demo.");
         }
       }
     }
@@ -255,20 +295,11 @@ export default function FaceBiometricDemoPage() {
     };
   }, []);
 
-  const distanceFromClassroom = useMemo(
-    () => calculateDistanceMeters(currentLocation, classroomLocation),
-    [classroomLocation, currentLocation],
-  );
-  const insideClassroom =
-    classroomLocation && currentLocation
-      ? distanceFromClassroom <= Number(radiusMeters)
-      : false;
-
   async function refreshLocation() {
     setLocationError("");
     if (!navigator.geolocation) {
       setLocationError("Geolocation is not supported in this browser.");
-      return;
+      return null;
     }
     return new Promise((resolve) => {
       navigator.geolocation.getCurrentPosition(
@@ -289,23 +320,157 @@ export default function FaceBiometricDemoPage() {
     });
   }
 
-  async function startCamera() {
-    if (streamRef.current && videoRef.current) {
-      videoRef.current.srcObject = streamRef.current;
-      setCameraOn(true);
+  async function fetchCourseConfig(courseCodeInput) {
+    const normalizedCode = normalizeCourseCode(courseCodeInput);
+    if (!normalizedCode) {
+      throw new Error("Enter a valid course code first.");
+    }
+    const snapshot = await getDoc(doc(db, COURSE_CONFIGS_COLLECTION, normalizedCode));
+    if (!snapshot.exists()) {
+      throw new Error("No lecturer classroom setup was found for that course code.");
+    }
+    return snapshot.data();
+  }
+
+  async function syncStudentRegistration(extra = {}) {
+    const normalizedCode = normalizeCourseCode(courseCode);
+    if (!studentName || !matNumber || !normalizedCode) return;
+    try {
+      await setDoc(
+        doc(db, STUDENT_REGISTRATIONS_COLLECTION, buildRegistrationId(matNumber, normalizedCode)),
+        {
+          studentName: studentName.trim(),
+          matNumber: matNumber.trim().toUpperCase(),
+          courseCode: normalizedCode,
+          courseTitle: courseConfig?.courseTitle || "",
+          lecturerName: courseConfig?.lecturerName || "",
+          lecturerEmail: courseConfig?.lecturerEmail || "",
+          classroomLocation,
+          radiusMeters,
+          updatedAt: serverTimestamp(),
+          ...extra,
+        },
+        { merge: true },
+      );
+      setFirebaseSyncOk(true);
+    } catch (error) {
+      setFirebaseSyncOk(false);
+      setFirebaseStatus(`Firebase registration write failed. ${error.code || ""}`.trim());
+    }
+  }
+
+  async function confirmCourseAndPresence() {
+    if (!studentName || !matNumber || !courseCode) {
+      setStatusMessage("Student name, MAT number, and course code are required.");
       return;
     }
+
+    setBusyAction("course-presence");
+    setStatusMessage("");
+    try {
+      const [config, latestLocation] = await Promise.all([
+        fetchCourseConfig(courseCode),
+        refreshLocation(),
+      ]);
+
+      if (!latestLocation) {
+        throw new Error("Allow location access so the system can confirm you are in class.");
+      }
+
+      setCourseConfig(config);
+      const distance = calculateDistanceMeters(latestLocation, config.classroomLocation);
+      if (typeof distance === "number" && distance > Number(config.radiusMeters || 0)) {
+        setPresenceConfirmed(false);
+        setStatusMessage(
+          `You are outside the approved classroom zone for ${config.courseCode}. Distance is ${Math.round(distance)} m.`,
+        );
+        return;
+      }
+
+      setPresenceConfirmed(true);
+      await syncStudentRegistration({
+        lastPresenceCheckDistance:
+          typeof distance === "number" ? Math.round(distance) : null,
+        presenceConfirmedAt: new Date().toISOString(),
+      });
+      setStatusMessage(
+        `Course verified. ${config.courseCode} attendance is now unlocked for face scan or biometric fallback.`,
+      );
+    } catch (error) {
+      setPresenceConfirmed(false);
+      setStatusMessage(error.message || "Could not verify course and classroom presence.");
+    } finally {
+      setBusyAction("");
+    }
+  }
+
+  async function attachStreamToVideo(stream) {
+    const video = videoRef.current;
+    if (!video) throw new Error("Camera element is not ready yet.");
+
+    setVideoReady(false);
+    video.muted = true;
+    video.playsInline = true;
+    video.autoplay = true;
+    video.srcObject = stream;
+
+    await new Promise((resolve, reject) => {
+      const timeout = window.setTimeout(
+        () => reject(new Error("Camera stream took too long to start.")),
+        5000,
+      );
+
+      const cleanup = () => {
+        window.clearTimeout(timeout);
+        video.onloadedmetadata = null;
+        video.oncanplay = null;
+      };
+
+      const handleReady = () => {
+        cleanup();
+        resolve();
+      };
+
+      video.onloadedmetadata = handleReady;
+      video.oncanplay = handleReady;
+    });
+
+    try {
+      await video.play();
+    } catch {
+      // Some browsers resolve once the stream is attached even if play()
+      // throws before the user gesture chain fully settles.
+    }
+
+    if ((video.videoWidth || 0) === 0) {
+      await new Promise((resolve) => window.setTimeout(resolve, 300));
+    }
+    setVideoReady(true);
+  }
+
+  async function startCamera() {
+    if (!presenceConfirmed) {
+      setStatusMessage("Confirm course and classroom presence before starting the camera.");
+      return;
+    }
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
+        video: {
+          facingMode: "user",
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+        },
         audio: false,
       });
       streamRef.current = stream;
-      if (videoRef.current) videoRef.current.srcObject = stream;
+      await attachStreamToVideo(stream);
       setCameraOn(true);
-      setStatusMessage("Camera ready. Align one face in the frame.");
+      setStatusMessage("Camera ready. The live feed should now be visible for face registration.");
     } catch (error) {
-      setStatusMessage("Camera access failed. Allow webcam access and retry.");
+      setCameraOn(false);
+      setVideoReady(false);
+      setStatusMessage(error.message || "Camera access failed. Allow webcam access and retry.");
     }
   }
 
@@ -314,7 +479,11 @@ export default function FaceBiometricDemoPage() {
       streamRef.current.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
     }
-    if (videoRef.current) videoRef.current.srcObject = null;
+    if (videoRef.current) {
+      videoRef.current.pause?.();
+      videoRef.current.srcObject = null;
+    }
+    setVideoReady(false);
     setCameraOn(false);
   }
 
@@ -330,7 +499,9 @@ export default function FaceBiometricDemoPage() {
 
   async function getFaceDescriptor() {
     if (!modelsReady) throw new Error("Face models are still loading.");
-    if (!videoRef.current || !cameraOn) throw new Error("Turn on the camera first.");
+    if (!videoRef.current || !cameraOn || !videoReady) {
+      throw new Error("Start the camera and wait for the live feed to appear first.");
+    }
 
     const detection = await faceapi
       .detectSingleFace(videoRef.current, new faceapi.TinyFaceDetectorOptions())
@@ -347,7 +518,7 @@ export default function FaceBiometricDemoPage() {
   async function pushAttendanceEntryToFirebase(entry) {
     if (!demoSessionId) return;
     try {
-      await addDoc(collection(db, "demoAttendanceLogs"), {
+      await addDoc(collection(db, ATTENDANCE_LOGS_COLLECTION), {
         ...entry,
         demoSessionId,
         createdAt: serverTimestamp(),
@@ -356,9 +527,7 @@ export default function FaceBiometricDemoPage() {
       setFirebaseStatus("Firebase sync active. Attendance event saved.");
     } catch (error) {
       setFirebaseSyncOk(false);
-      setFirebaseStatus(
-        `Firebase write blocked. Check Firestore rules. ${error.code || ""}`.trim(),
-      );
+      setFirebaseStatus(`Firebase write blocked. Check Firestore rules. ${error.code || ""}`.trim());
     }
   }
 
@@ -368,8 +537,12 @@ export default function FaceBiometricDemoPage() {
       at: new Date().toISOString(),
       sessionTitle,
       studentName: registeredProfile?.name || studentName,
+      matNumber: matNumber.trim().toUpperCase(),
+      courseCode: normalizeCourseCode(courseCode),
+      courseTitle: courseConfig?.courseTitle || "",
+      lecturerName: courseConfig?.lecturerName || "",
       method,
-      classroomRadius: Number(radiusMeters),
+      classroomRadius: radiusMeters,
       distanceFromClassroom:
         typeof distanceFromClassroom === "number"
           ? Math.round(distanceFromClassroom)
@@ -380,20 +553,47 @@ export default function FaceBiometricDemoPage() {
     void pushAttendanceEntryToFirebase(entry);
   }
 
+  async function ensureInsideClassroomForAttendance() {
+    const latestLocation = (await refreshLocation()) || currentLocation;
+    const latestDistance = calculateDistanceMeters(latestLocation, classroomLocation);
+    if (classroomLocation && latestLocation && latestDistance > radiusMeters) {
+      logAttendance("location-check", {
+        result: "blocked",
+        reason: "outside-geofence",
+        distanceFromClassroom: Math.round(latestDistance),
+      });
+      throw new Error(
+        `You are outside the classroom geofence. Move closer to class and try again.`,
+      );
+    }
+    return latestDistance;
+  }
+
   async function handleRegisterFace() {
+    if (!presenceConfirmed) {
+      setStatusMessage("Confirm course and classroom presence first.");
+      return;
+    }
+
     setBusyAction("face-register");
     setStatusMessage("");
     try {
       const descriptor = await getFaceDescriptor();
       const snapshot = capturePhotoDataUrl();
-      setRegisteredProfile((prev) => ({
-        ...prev,
+      const profile = {
+        ...registeredProfile,
         name: studentName,
+        matNumber: matNumber.trim().toUpperCase(),
+        courseCode: normalizeCourseCode(courseCode),
         faceDescriptor: descriptor,
         facePreview: snapshot,
         faceRegisteredAt: new Date().toISOString(),
-      }));
-      setStatusMessage("Face registered successfully for demo verification.");
+      };
+      setRegisteredProfile(profile);
+      await syncStudentRegistration({
+        faceRegisteredAt: profile.faceRegisteredAt,
+      });
+      setStatusMessage("Face registered successfully. You can now verify attendance with a live face scan.");
     } catch (error) {
       setStatusMessage(error.message || "Face registration failed.");
     } finally {
@@ -410,12 +610,9 @@ export default function FaceBiometricDemoPage() {
     setBusyAction("face-verify");
     setStatusMessage("");
     try {
-      await refreshLocation();
+      await ensureInsideClassroomForAttendance();
       const candidate = await getFaceDescriptor();
-      const distance = faceapi.euclideanDistance(
-        candidate,
-        registeredProfile.faceDescriptor,
-      );
+      const distance = faceapi.euclideanDistance(candidate, registeredProfile.faceDescriptor);
       setLastFaceDistance(distance);
 
       if (distance > FACE_DISTANCE_THRESHOLD) {
@@ -434,7 +631,7 @@ export default function FaceBiometricDemoPage() {
         faceDistance: Number(distance.toFixed(4)),
       });
       setStatusMessage(
-        `Face matched successfully. Distance ${distance.toFixed(4)} is within range.`,
+        `Attendance accepted for ${normalizeCourseCode(courseCode)}. Face distance ${distance.toFixed(4)} is within range.`,
       );
     } catch (error) {
       setStatusMessage(error.message || "Face verification failed.");
@@ -444,6 +641,10 @@ export default function FaceBiometricDemoPage() {
   }
 
   async function handleRegisterBiometric() {
+    if (!presenceConfirmed) {
+      setStatusMessage("Confirm course and classroom presence first.");
+      return;
+    }
     if (!window.PublicKeyCredential || !navigator.credentials) {
       setStatusMessage("Passkeys/WebAuthn are not supported on this device.");
       return;
@@ -459,7 +660,7 @@ export default function FaceBiometricDemoPage() {
           rp: { name: "Smart Attendance Demo" },
           user: {
             id: userId,
-            name: `${studentName.toLowerCase().replace(/\s+/g, ".")}@demo.local`,
+            name: `${matNumber.trim().toLowerCase()}@demo.local`,
             displayName: studentName,
           },
           pubKeyCredParams: [
@@ -477,15 +678,21 @@ export default function FaceBiometricDemoPage() {
 
       if (!credential) throw new Error("Biometric registration was cancelled.");
 
-      setRegisteredProfile((prev) => ({
-        ...prev,
+      const profile = {
+        ...registeredProfile,
         name: studentName,
+        matNumber: matNumber.trim().toUpperCase(),
+        courseCode: normalizeCourseCode(courseCode),
         passkeyCredentialId: toBase64Url(credential.rawId),
         passkeyUserId: toBase64Url(userId),
         passkeyRegisteredAt: new Date().toISOString(),
-      }));
+      };
+      setRegisteredProfile(profile);
+      await syncStudentRegistration({
+        passkeyRegisteredAt: profile.passkeyRegisteredAt,
+      });
       setStatusMessage(
-        "Biometric/passkey registered. Supported devices will now prompt fingerprint, face, or secure unlock.",
+        "Biometric fallback registered. This device can now prompt fingerprint, face unlock, or secure device unlock.",
       );
     } catch (error) {
       setStatusMessage(error.message || "Biometric registration failed.");
@@ -503,21 +710,7 @@ export default function FaceBiometricDemoPage() {
     setBusyAction("biometric-attendance");
     setStatusMessage("");
     try {
-      const latestLocation = (await refreshLocation()) || currentLocation;
-      const latestDistance = calculateDistanceMeters(latestLocation, classroomLocation);
-
-      if (classroomLocation && latestLocation && latestDistance > Number(radiusMeters)) {
-        logAttendance("biometric", {
-          result: "blocked",
-          reason: "outside-geofence",
-          distanceFromClassroom: Math.round(latestDistance),
-        });
-        setStatusMessage(
-          `Biometric fallback blocked. Device is ${Math.round(latestDistance)} m from the classroom zone.`,
-        );
-        return;
-      }
-
+      await ensureInsideClassroomForAttendance();
       const credential = await navigator.credentials.get({
         publicKey: {
           challenge: randomBytes(32),
@@ -539,7 +732,7 @@ export default function FaceBiometricDemoPage() {
         userVerification: "prompted",
       });
       setStatusMessage(
-        "Biometric attendance accepted. The device completed a native passkey/biometric prompt.",
+        `Biometric attendance accepted for ${normalizeCourseCode(courseCode)}. The device completed a native biometric prompt.`,
       );
     } catch (error) {
       setStatusMessage(error.message || "Biometric attendance failed.");
@@ -551,9 +744,12 @@ export default function FaceBiometricDemoPage() {
   function resetDemo() {
     stopCamera();
     setRegisteredProfile(null);
-    setClassroomLocation(null);
+    setCourseConfig(null);
     setAttendanceLog([]);
     setLastFaceDistance(null);
+    setPresenceConfirmed(false);
+    setMatNumber("");
+    setCourseCode("");
     setFirebaseSyncOk(false);
     setStatusMessage("Demo reset complete.");
     window.localStorage.removeItem(STORAGE_KEY);
@@ -565,20 +761,26 @@ export default function FaceBiometricDemoPage() {
         <div className="mb-6 rounded-3xl border border-amber-500/25 bg-amber-500/10 p-5">
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div>
-              <h1 className="text-3xl font-black">Face Scan + Biometric Demo</h1>
+              <h1 className="text-3xl font-black">Student Face Scan + Biometric Demo</h1>
               <p className="mt-2 max-w-3xl text-sm text-white/65">
-                Demo mode for today’s presentation: face registration and face
-                verification run in the browser with `face-api.js`, while biometric
-                fallback uses native WebAuthn/passkey prompts on supported devices.
-                Attendance logs are stored locally and mirrored to Firebase when
-                Firestore is available.
+                Students now enter MAT number and course code first. The system loads
+                the lecturer’s classroom geofence from Firebase, confirms class
+                presence with GPS, then unlocks face scan or fingerprint fallback for attendance.
               </p>
             </div>
-            <div className="flex flex-wrap items-center gap-2">
+            <div className="flex flex-wrap items-center gap-3">
+              <a
+                href="/demo/admin"
+                className="rounded-2xl border border-indigo-500/25 bg-indigo-500/10 px-4 py-2 text-sm font-semibold text-indigo-200 transition hover:bg-indigo-500/20"
+              >
+                Lecturer Admin
+              </a>
               <StatusPill ok={modelsReady}>
                 {modelsReady ? "Face Models Ready" : "Loading Face Models"}
               </StatusPill>
-              <StatusPill ok={firebaseSyncOk}>{firebaseSyncOk ? "Firebase Sync On" : "Firebase Pending"}</StatusPill>
+              <StatusPill ok={firebaseSyncOk}>
+                {firebaseSyncOk ? "Firebase Sync On" : "Firebase Pending"}
+              </StatusPill>
             </div>
           </div>
           {modelsError ? (
@@ -596,9 +798,9 @@ export default function FaceBiometricDemoPage() {
             <div className="rounded-3xl border border-white/10 bg-white/5 p-5">
               <div className="mb-4 flex items-center justify-between gap-3">
                 <div>
-                  <h2 className="text-xl font-bold">1. Session + Proximity Setup</h2>
+                  <h2 className="text-xl font-bold">1. Student Registration + Course Check</h2>
                   <p className="text-sm text-white/50">
-                    Use your current position as the classroom zone for the demo.
+                    Enter your MAT number and course code, then verify you are inside the lecturer’s classroom geofence.
                   </p>
                 </div>
                 <button
@@ -612,26 +814,28 @@ export default function FaceBiometricDemoPage() {
 
               <div className="grid gap-4 md:grid-cols-2">
                 <label className="space-y-2">
-                  <span className="text-sm font-medium text-white/75">Session title</span>
+                  <span className="text-sm font-medium text-white/75">Student name</span>
                   <input
-                    value={sessionTitle}
-                    onChange={(e) => setSessionTitle(e.target.value)}
+                    value={studentName}
+                    onChange={(e) => setStudentName(e.target.value)}
                     className="w-full rounded-2xl border border-white/10 bg-[#12121A] px-4 py-3 text-sm text-white outline-none transition focus:border-indigo-500"
                   />
                 </label>
                 <label className="space-y-2">
-                  <span className="text-sm font-medium text-white/75">Classroom radius</span>
-                  <select
-                    value={radiusMeters}
-                    onChange={(e) => setRadiusMeters(Number(e.target.value))}
+                  <span className="text-sm font-medium text-white/75">MAT number</span>
+                  <input
+                    value={matNumber}
+                    onChange={(e) => setMatNumber(e.target.value)}
                     className="w-full rounded-2xl border border-white/10 bg-[#12121A] px-4 py-3 text-sm text-white outline-none transition focus:border-indigo-500"
-                  >
-                    {[30, 50, 80, 100, 150].map((value) => (
-                      <option key={value} value={value}>
-                        {value} meters
-                      </option>
-                    ))}
-                  </select>
+                  />
+                </label>
+                <label className="space-y-2 md:col-span-2">
+                  <span className="text-sm font-medium text-white/75">Course code</span>
+                  <input
+                    value={courseCode}
+                    onChange={(e) => setCourseCode(normalizeCourseCode(e.target.value))}
+                    className="w-full rounded-2xl border border-white/10 bg-[#12121A] px-4 py-3 text-sm text-white outline-none transition focus:border-indigo-500"
+                  />
                 </label>
               </div>
 
@@ -650,38 +854,38 @@ export default function FaceBiometricDemoPage() {
                 <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
                   <div className="mb-2 flex items-center gap-2 text-sm font-semibold text-white">
                     <Shield size={16} className="text-emerald-400" />
-                    Classroom zone
+                    Lecturer classroom setup
                   </div>
                   <p className="text-sm text-white/60">
-                    {classroomLocation
-                      ? `${classroomLocation.lat.toFixed(5)}, ${classroomLocation.lng.toFixed(5)}`
-                      : "Not set yet. Capture your current location as the classroom anchor."}
+                    {courseConfig
+                      ? `${courseConfig.courseCode} · ${courseConfig.courseTitle}`
+                      : "No course loaded yet."}
                   </p>
+                  {courseConfig ? (
+                    <div className="mt-2 text-xs text-white/50">
+                      Lecturer: {courseConfig.lecturerName || "N/A"} · Radius: {courseConfig.radiusMeters}m
+                    </div>
+                  ) : null}
                 </div>
               </div>
 
               <div className="mt-4 flex flex-wrap items-center gap-3">
                 <button
-                  onClick={async () => {
-                    const location = currentLocation || (await refreshLocation());
-                    if (!location) {
-                      setStatusMessage("Could not set classroom location without GPS.");
-                      return;
-                    }
-                    setClassroomLocation(location);
-                    setStatusMessage("Classroom location captured from this device.");
-                  }}
-                  className="inline-flex items-center gap-2 rounded-2xl bg-indigo-600 px-4 py-3 text-sm font-semibold text-white transition hover:bg-indigo-500"
+                  onClick={confirmCourseAndPresence}
+                  disabled={busyAction !== ""}
+                  className="inline-flex items-center gap-2 rounded-2xl bg-indigo-600 px-4 py-3 text-sm font-semibold text-white transition hover:bg-indigo-500 disabled:opacity-50"
                 >
-                  <MapPin size={16} />
-                  Use Current Location As Classroom
+                  {busyAction === "course-presence" ? (
+                    <LoaderCircle size={16} className="animate-spin" />
+                  ) : (
+                    <CheckCircle size={16} />
+                  )}
+                  Confirm Course And Class Presence
                 </button>
-                <StatusPill ok={!!classroomLocation && insideClassroom}>
-                  {classroomLocation
-                    ? insideClassroom
-                      ? "Inside Classroom Zone"
-                      : `Outside Zone (${formatDistance(distanceFromClassroom)})`
-                    : "Classroom Zone Not Set"}
+                <StatusPill ok={presenceConfirmed}>
+                  {presenceConfirmed
+                    ? `Presence confirmed (${formatDistance(distanceFromClassroom)})`
+                    : "Presence not confirmed"}
                 </StatusPill>
               </div>
             </div>
@@ -689,9 +893,9 @@ export default function FaceBiometricDemoPage() {
             <div className="rounded-3xl border border-white/10 bg-white/5 p-5">
               <div className="mb-4 flex items-center justify-between gap-3">
                 <div>
-                  <h2 className="text-xl font-bold">2. Camera + Face Registration</h2>
+                  <h2 className="text-xl font-bold">2. Face Registration And Attendance</h2>
                   <p className="text-sm text-white/50">
-                    Register one face, then scan again to prove a live match.
+                    After the course is validated, start the camera, register your face, then scan again for attendance.
                   </p>
                 </div>
                 <div className="flex gap-2">
@@ -716,39 +920,33 @@ export default function FaceBiometricDemoPage() {
 
               <div className="grid gap-5 lg:grid-cols-[1.1fr_0.9fr]">
                 <div className="overflow-hidden rounded-3xl border border-white/10 bg-black/40">
-                  <div className="aspect-video">
-                    {cameraOn ? (
-                      <video
-                        ref={videoRef}
-                        autoPlay
-                        playsInline
-                        muted
-                        className="h-full w-full object-cover"
-                      />
-                    ) : (
-                      <div className="flex h-full items-center justify-center text-white/35">
+                  <div className="relative aspect-video">
+                    <video
+                      ref={videoRef}
+                      autoPlay
+                      playsInline
+                      muted
+                      className={`h-full w-full object-cover ${cameraOn ? "block" : "hidden"}`}
+                    />
+                    {!cameraOn ? (
+                      <div className="absolute inset-0 flex items-center justify-center text-white/35">
                         <div className="text-center">
                           <Camera size={42} className="mx-auto mb-3" />
                           Camera preview will appear here
                         </div>
                       </div>
-                    )}
+                    ) : !videoReady ? (
+                      <div className="absolute inset-0 flex items-center justify-center bg-black/65 text-sm text-white/70">
+                        Waiting for live camera feed...
+                      </div>
+                    ) : null}
                   </div>
                 </div>
 
                 <div className="space-y-4">
-                  <label className="space-y-2">
-                    <span className="text-sm font-medium text-white/75">Student name</span>
-                    <input
-                      value={studentName}
-                      onChange={(e) => setStudentName(e.target.value)}
-                      className="w-full rounded-2xl border border-white/10 bg-[#12121A] px-4 py-3 text-sm text-white outline-none transition focus:border-indigo-500"
-                    />
-                  </label>
-
                   <button
                     onClick={handleRegisterFace}
-                    disabled={!cameraOn || !modelsReady || busyAction !== ""}
+                    disabled={!cameraOn || !videoReady || !modelsReady || busyAction !== ""}
                     className="flex w-full items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-indigo-600 to-purple-600 px-4 py-3 text-sm font-semibold text-white transition hover:from-indigo-500 hover:to-purple-500 disabled:opacity-50"
                   >
                     {busyAction === "face-register" ? (
@@ -761,7 +959,7 @@ export default function FaceBiometricDemoPage() {
 
                   <button
                     onClick={handleVerifyFace}
-                    disabled={!cameraOn || !registeredProfile?.faceDescriptor || busyAction !== ""}
+                    disabled={!cameraOn || !videoReady || !registeredProfile?.faceDescriptor || busyAction !== ""}
                     className="flex w-full items-center justify-center gap-2 rounded-2xl bg-emerald-600 px-4 py-3 text-sm font-semibold text-white transition hover:bg-emerald-500 disabled:opacity-50"
                   >
                     {busyAction === "face-verify" ? (
@@ -769,13 +967,11 @@ export default function FaceBiometricDemoPage() {
                     ) : (
                       <CheckCircle size={16} />
                     )}
-                    Verify Face And Mark Attendance
+                    Scan Face For Attendance
                   </button>
 
                   <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
-                    <div className="mb-2 text-sm font-semibold text-white">
-                      Registered student
-                    </div>
+                    <div className="mb-2 text-sm font-semibold text-white">Registered face profile</div>
                     {registeredProfile?.facePreview ? (
                       <div className="flex items-center gap-3">
                         <img
@@ -784,14 +980,11 @@ export default function FaceBiometricDemoPage() {
                           className="h-16 w-16 rounded-2xl object-cover"
                         />
                         <div className="text-sm text-white/65">
-                          <div className="font-semibold text-white">
-                            {registeredProfile.name}
-                          </div>
+                          <div className="font-semibold text-white">{registeredProfile.name}</div>
+                          <div>{registeredProfile.matNumber} · {registeredProfile.courseCode}</div>
                           <div>
                             Face registered{" "}
-                            {new Date(
-                              registeredProfile.faceRegisteredAt,
-                            ).toLocaleTimeString()}
+                            {new Date(registeredProfile.faceRegisteredAt).toLocaleTimeString()}
                           </div>
                           {lastFaceDistance != null ? (
                             <div>Last face distance: {lastFaceDistance.toFixed(4)}</div>
@@ -799,9 +992,7 @@ export default function FaceBiometricDemoPage() {
                         </div>
                       </div>
                     ) : (
-                      <p className="text-sm text-white/45">
-                        No registered face yet.
-                      </p>
+                      <p className="text-sm text-white/45">No registered face yet.</p>
                     )}
                   </div>
                 </div>
@@ -809,11 +1000,9 @@ export default function FaceBiometricDemoPage() {
             </div>
 
             <div className="rounded-3xl border border-white/10 bg-white/5 p-5">
-              <h2 className="text-xl font-bold">3. Biometric Fallback</h2>
+              <h2 className="text-xl font-bold">3. Fingerprint / Biometric Fallback</h2>
               <p className="mt-1 text-sm text-white/50">
-                This uses the device’s native passkey/WebAuthn prompt. On supported
-                phones and laptops it will trigger fingerprint, face unlock, or the
-                secure device unlock method.
+                If the face scan is unavailable, students can register and use a passkey-backed biometric prompt as a secure fallback.
               </p>
 
               <div className="mt-4 grid gap-4 md:grid-cols-2">
@@ -839,7 +1028,7 @@ export default function FaceBiometricDemoPage() {
                   ) : (
                     <Shield size={16} />
                   )}
-                  Biometric Check-In
+                  Use Fingerprint / Biometric
                 </button>
               </div>
 
@@ -851,12 +1040,7 @@ export default function FaceBiometricDemoPage() {
                     : "No biometric/passkey registered yet."}
                 </div>
                 <div className="mt-2">
-                  Geofence check:{" "}
-                  {classroomLocation
-                    ? insideClassroom
-                      ? "inside classroom radius"
-                      : "outside classroom radius"
-                    : "classroom not configured"}
+                  Lecturer approval path: {courseConfig?.lecturerName || "No lecturer course loaded"}
                 </div>
               </div>
             </div>
@@ -872,20 +1056,19 @@ export default function FaceBiometricDemoPage() {
                 <StatusPill ok={firebaseSyncOk}>
                   {firebaseSyncOk ? "Firebase sync active" : "Firebase sync pending"}
                 </StatusPill>
+                <StatusPill ok={presenceConfirmed}>
+                  {presenceConfirmed ? "Course and location confirmed" : "Course not confirmed"}
+                </StatusPill>
+                <StatusPill ok={cameraOn && videoReady}>
+                  {cameraOn && videoReady ? "Live camera feed visible" : "Camera feed not active"}
+                </StatusPill>
                 <StatusPill ok={!!registeredProfile?.faceDescriptor}>
-                  {registeredProfile?.faceDescriptor
-                    ? "Face profile registered"
-                    : "Face profile not registered"}
+                  {registeredProfile?.faceDescriptor ? "Face profile registered" : "Face profile not registered"}
                 </StatusPill>
                 <StatusPill ok={!!registeredProfile?.passkeyCredentialId}>
                   {registeredProfile?.passkeyCredentialId
                     ? "Biometric/passkey registered"
                     : "Biometric/passkey not registered"}
-                </StatusPill>
-                <StatusPill ok={!classroomLocation || insideClassroom}>
-                  {classroomLocation
-                    ? `Geofence distance: ${formatDistance(distanceFromClassroom)}`
-                    : "No classroom geofence set"}
                 </StatusPill>
               </div>
 
@@ -893,7 +1076,7 @@ export default function FaceBiometricDemoPage() {
                 className={`mt-4 rounded-2xl border px-4 py-3 text-sm ${
                   statusMessage.includes("failed") ||
                   statusMessage.includes("mismatch") ||
-                  statusMessage.includes("blocked")
+                  statusMessage.includes("outside")
                     ? "border-red-500/30 bg-red-500/10 text-red-200"
                     : "border-white/10 bg-black/20 text-white/70"
                 }`}
@@ -911,14 +1094,21 @@ export default function FaceBiometricDemoPage() {
             </div>
 
             <div className="rounded-3xl border border-white/10 bg-white/5 p-5">
-              <h2 className="text-xl font-bold">Demo Script</h2>
-              <div className="mt-4 space-y-3 text-sm text-white/65">
-                <p>1. Refresh location and set the classroom zone from your current device.</p>
-                <p>2. Start the camera and register the student face.</p>
-                <p>3. Register the device biometric or passkey.</p>
-                <p>4. Run a face verification check-in.</p>
-                <p>5. Move outside the zone or change the radius to show fallback blocking.</p>
-                <p>6. Run biometric check-in to show the native fingerprint or face unlock prompt.</p>
+              <h2 className="text-xl font-bold">Loaded Course</h2>
+              <div className="mt-4 text-sm text-white/65">
+                {courseConfig ? (
+                  <div className="space-y-2">
+                    <div>{courseConfig.courseCode} · {courseConfig.courseTitle}</div>
+                    <div>Lecturer: {courseConfig.lecturerName || "N/A"}</div>
+                    <div>Classroom radius: {courseConfig.radiusMeters} m</div>
+                    <div>
+                      Classroom: {classroomLocation?.lat?.toFixed(5)}, {classroomLocation?.lng?.toFixed(5)}
+                    </div>
+                    <div>Current distance: {formatDistance(distanceFromClassroom)}</div>
+                  </div>
+                ) : (
+                  <div>No lecturer course has been loaded yet.</div>
+                )}
               </div>
             </div>
 
@@ -937,14 +1127,11 @@ export default function FaceBiometricDemoPage() {
                   </div>
                 ) : (
                   attendanceLog.map((entry) => (
-                    <div
-                      key={entry.id}
-                      className="rounded-2xl border border-white/10 bg-black/20 p-4"
-                    >
+                    <div key={entry.id} className="rounded-2xl border border-white/10 bg-black/20 p-4">
                       <div className="flex items-start justify-between gap-3">
                         <div>
                           <div className="text-sm font-semibold text-white">
-                            {entry.studentName} · {entry.method}
+                            {entry.studentName} · {entry.matNumber} · {entry.courseCode}
                           </div>
                           <div className="mt-1 text-xs text-white/45">
                             {new Date(entry.at).toLocaleString()}
@@ -954,8 +1141,7 @@ export default function FaceBiometricDemoPage() {
                           className={`rounded-full px-2.5 py-1 text-xs font-semibold ${
                             entry.result === "accepted"
                               ? "bg-emerald-500/15 text-emerald-300"
-                              : entry.result === "blocked" ||
-                                  entry.result === "rejected"
+                              : entry.result === "blocked" || entry.result === "rejected"
                                 ? "bg-red-500/15 text-red-300"
                                 : "bg-white/10 text-white/65"
                           }`}
@@ -964,13 +1150,10 @@ export default function FaceBiometricDemoPage() {
                         </span>
                       </div>
                       <div className="mt-3 grid gap-2 text-xs text-white/55">
-                        <div>Session: {entry.sessionTitle}</div>
-                        <div>
-                          Geofence distance: {formatDistance(entry.distanceFromClassroom)}
-                        </div>
-                        {entry.faceDistance != null ? (
-                          <div>Face distance: {entry.faceDistance}</div>
-                        ) : null}
+                        <div>Method: {entry.method}</div>
+                        <div>Course: {entry.courseTitle || entry.sessionTitle}</div>
+                        <div>Distance: {formatDistance(entry.distanceFromClassroom)}</div>
+                        {entry.faceDistance != null ? <div>Face distance: {entry.faceDistance}</div> : null}
                         {entry.reason ? <div>Reason: {entry.reason}</div> : null}
                       </div>
                     </div>
