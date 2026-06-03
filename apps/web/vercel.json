@@ -1,0 +1,13 @@
+{
+  "installCommand": "npm install",
+  "buildCommand": "npm run build",
+  "routes": [
+    {
+      "handle": "filesystem"
+    },
+    {
+      "src": "^/(?!api(?:/|$)|assets(?:/|$)|favicon\\.ico$|robots\\.txt$|manifest\\.json$).*$",
+      "dest": "/"
+    }
+  ]
+}
