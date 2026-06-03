@@ -1,9 +1,8 @@
 import fg from 'fast-glob';
-import type { Route } from './+types/not-found';
 import { useNavigate } from 'react-router';
 import { useCallback, useEffect, useState } from 'react';
 
-export async function loader({ params }: Route.LoaderArgs) {
+export async function loader({ params }) {
   const matches = await fg('src/**/page.{js,jsx,ts,tsx}');
   return {
     path: `/${params['*']}`,
@@ -18,26 +17,15 @@ export async function loader({ params }: Route.LoaderArgs) {
   };
 }
 
-interface ParentSitemap {
-  webPages?: Array<{
-    id: string;
-    name: string;
-    filePath: string;
-    cleanRoute?: string;
-  }>;
-}
-
 export default function CreateDefaultNotFoundPage({
   loaderData,
-}: {
-  loaderData: Awaited<ReturnType<typeof loader>>;
 }) {
-  const [siteMap, setSitemap] = useState<ParentSitemap | null>(null);
+  const [siteMap, setSitemap] = useState(null);
   const navigate = useNavigate();
 
   useEffect(() => {
     if (typeof window !== 'undefined' && window.parent && window.parent !== window) {
-      const handler = (event: MessageEvent) => {
+      const handler = (event) => {
         if (event.data.type === 'sandbox:sitemap') {
           window.removeEventListener('message', handler);
           setSitemap(event.data.sitemap);
@@ -67,7 +55,7 @@ export default function CreateDefaultNotFoundPage({
     navigate('/');
   };
 
-  const handleSearch = (value: string) => {
+  const handleSearch = (value) => {
     if (!siteMap) {
       const path = `/${value}`;
       navigate(path);
