@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as faceapi from "face-api.js";
+import { addDoc, collection, doc, serverTimestamp, setDoc } from "firebase/firestore";
 import {
   Camera,
   CheckCircle,
@@ -14,9 +15,11 @@ import {
   UserCheck,
   XCircle,
 } from "lucide-react";
+import { db, initFirebaseAnalytics } from "@/utils/firebase.client";
 
 const MODELS_URL = "https://justadudewhohacks.github.io/face-api.js/models";
 const STORAGE_KEY = "smart-attendance-face-biometric-demo";
+const SESSION_ID_KEY = "smart-attendance-face-biometric-demo-session-id";
 const FACE_DISTANCE_THRESHOLD = 0.52;
 
 function randomBytes(length) {
@@ -60,6 +63,18 @@ function calculateDistanceMeters(from, to) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
+function sanitizeRegisteredProfile(profile) {
+  if (!profile) return null;
+  return {
+    name: profile.name || "",
+    faceRegisteredAt: profile.faceRegisteredAt || null,
+    faceDescriptor: profile.faceDescriptor || null,
+    passkeyCredentialId: profile.passkeyCredentialId || null,
+    passkeyUserId: profile.passkeyUserId || null,
+    passkeyRegisteredAt: profile.passkeyRegisteredAt || null,
+  };
+}
+
 function StatusPill({ ok, children }) {
   return (
     <span
@@ -92,9 +107,16 @@ export default function FaceBiometricDemoPage() {
   const [attendanceLog, setAttendanceLog] = useState([]);
   const [studentName, setStudentName] = useState("Demo Student");
   const [lastFaceDistance, setLastFaceDistance] = useState(null);
+  const [demoSessionId, setDemoSessionId] = useState("");
+  const [firebaseStatus, setFirebaseStatus] = useState("Firebase sync not started yet.");
+  const [firebaseSyncOk, setFirebaseSyncOk] = useState(false);
 
   useEffect(() => {
     const saved = window.localStorage.getItem(STORAGE_KEY);
+    const savedSessionId =
+      window.localStorage.getItem(SESSION_ID_KEY) || `demo-${crypto.randomUUID()}`;
+    window.localStorage.setItem(SESSION_ID_KEY, savedSessionId);
+    setDemoSessionId(savedSessionId);
     if (!saved) return;
     try {
       const parsed = JSON.parse(saved);
@@ -107,6 +129,23 @@ export default function FaceBiometricDemoPage() {
     } catch {
       window.localStorage.removeItem(STORAGE_KEY);
     }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function setupFirebase() {
+      await initFirebaseAnalytics();
+      if (!cancelled) {
+        setFirebaseStatus("Firebase configured. Firestore sync will be attempted.");
+      }
+    }
+
+    setupFirebase();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -124,6 +163,62 @@ export default function FaceBiometricDemoPage() {
   }, [
     attendanceLog,
     classroomLocation,
+    radiusMeters,
+    registeredProfile,
+    sessionTitle,
+    studentName,
+  ]);
+
+  useEffect(() => {
+    if (!demoSessionId) return;
+    let cancelled = false;
+
+    async function syncSessionSnapshot() {
+      try {
+        await setDoc(
+          doc(db, "demoSessions", demoSessionId),
+          {
+            demoSessionId,
+            sessionTitle,
+            radiusMeters: Number(radiusMeters),
+            studentName,
+            classroomLocation,
+            currentLocation,
+            registeredProfile: sanitizeRegisteredProfile(registeredProfile),
+            attendanceLog,
+            lastFaceDistance:
+              typeof lastFaceDistance === "number"
+                ? Number(lastFaceDistance.toFixed(4))
+                : null,
+            updatedAt: serverTimestamp(),
+          },
+          { merge: true },
+        );
+        if (!cancelled) {
+          setFirebaseSyncOk(true);
+          setFirebaseStatus("Firebase sync active. Demo data is being saved.");
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setFirebaseSyncOk(false);
+          setFirebaseStatus(
+            `Firebase sync unavailable. Enable Firestore or relax demo rules. ${error.code || ""}`.trim(),
+          );
+        }
+      }
+    }
+
+    syncSessionSnapshot();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    attendanceLog,
+    classroomLocation,
+    currentLocation,
+    demoSessionId,
+    lastFaceDistance,
     radiusMeters,
     registeredProfile,
     sessionTitle,
@@ -249,6 +344,24 @@ export default function FaceBiometricDemoPage() {
     return Array.from(detection.descriptor);
   }
 
+  async function pushAttendanceEntryToFirebase(entry) {
+    if (!demoSessionId) return;
+    try {
+      await addDoc(collection(db, "demoAttendanceLogs"), {
+        ...entry,
+        demoSessionId,
+        createdAt: serverTimestamp(),
+      });
+      setFirebaseSyncOk(true);
+      setFirebaseStatus("Firebase sync active. Attendance event saved.");
+    } catch (error) {
+      setFirebaseSyncOk(false);
+      setFirebaseStatus(
+        `Firebase write blocked. Check Firestore rules. ${error.code || ""}`.trim(),
+      );
+    }
+  }
+
   function logAttendance(method, details = {}) {
     const entry = {
       id: crypto.randomUUID(),
@@ -264,6 +377,7 @@ export default function FaceBiometricDemoPage() {
       ...details,
     };
     setAttendanceLog((prev) => [entry, ...prev].slice(0, 12));
+    void pushAttendanceEntryToFirebase(entry);
   }
 
   async function handleRegisterFace() {
@@ -440,6 +554,7 @@ export default function FaceBiometricDemoPage() {
     setClassroomLocation(null);
     setAttendanceLog([]);
     setLastFaceDistance(null);
+    setFirebaseSyncOk(false);
     setStatusMessage("Demo reset complete.");
     window.localStorage.removeItem(STORAGE_KEY);
   }
@@ -455,18 +570,25 @@ export default function FaceBiometricDemoPage() {
                 Demo mode for today’s presentation: face registration and face
                 verification run in the browser with `face-api.js`, while biometric
                 fallback uses native WebAuthn/passkey prompts on supported devices.
-                Attendance logs are stored locally in this browser for a smooth demo.
+                Attendance logs are stored locally and mirrored to Firebase when
+                Firestore is available.
               </p>
             </div>
-            <StatusPill ok={modelsReady}>
-              {modelsReady ? "Face Models Ready" : "Loading Face Models"}
-            </StatusPill>
+            <div className="flex flex-wrap items-center gap-2">
+              <StatusPill ok={modelsReady}>
+                {modelsReady ? "Face Models Ready" : "Loading Face Models"}
+              </StatusPill>
+              <StatusPill ok={firebaseSyncOk}>{firebaseSyncOk ? "Firebase Sync On" : "Firebase Pending"}</StatusPill>
+            </div>
           </div>
           {modelsError ? (
             <div className="mt-4 rounded-2xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-200">
               {modelsError}
             </div>
           ) : null}
+          <div className="mt-4 rounded-2xl border border-white/10 bg-black/20 px-4 py-3 text-sm text-white/65">
+            {firebaseStatus}
+          </div>
         </div>
 
         <div className="grid gap-6 lg:grid-cols-[1.15fr_0.85fr]">
@@ -746,6 +868,9 @@ export default function FaceBiometricDemoPage() {
               <div className="mt-4 grid gap-3">
                 <StatusPill ok={modelsReady}>
                   {modelsReady ? "Face recognition models loaded" : "Loading models"}
+                </StatusPill>
+                <StatusPill ok={firebaseSyncOk}>
+                  {firebaseSyncOk ? "Firebase sync active" : "Firebase sync pending"}
                 </StatusPill>
                 <StatusPill ok={!!registeredProfile?.faceDescriptor}>
                   {registeredProfile?.faceDescriptor
